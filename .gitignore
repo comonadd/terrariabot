@@ -2,3 +2,4 @@ TShock
 .idea
 world_snapshot.png
 *.png
+__pycache__

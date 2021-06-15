@@ -16,6 +16,8 @@ import win32gui
 import win32ui
 from ctypes import windll
 import pygame
+import action_controller as ac
+import keyboard
 
 # Tiles for which the frame is considered "important".
 TILE_FRAME_IMPORTANT = [
@@ -207,6 +209,7 @@ def msg_data_add_float(b, f):
 
 Color = List[int]
 
+CHARACTER_WIDTH = 16.0
 CHARACTER_HEIGHT = 48.0
 
 def tile_coord_to_pos(coord):
@@ -472,10 +475,11 @@ def write_world_chunk_to_image(img, tiles, x_start, y_start, width, height):
             img.putpixel((x,y), clr)
     img.save('world_snapshot.png')
 
-CONTROL_LEFT = 0x04
-CONTROL_RIGHT = 0x08
-CONTROL_JUMP = 0x10
-POSSIBLE_ACTIONS = [CONTROL_JUMP, CONTROL_LEFT, CONTROL_RIGHT]
+# CONTROL_LEFT = 0x04
+# CONTROL_RIGHT = 0x08
+# CONTROL_JUMP = 0x10
+# POSSIBLE_ACTIONS = [CONTROL_JUMP, CONTROL_LEFT, CONTROL_RIGHT]
+POSSIBLE_ACTIONS = [ac.move_right, ac.move_left, ac.jump]
 
 class Client:
     running = False
@@ -818,6 +822,8 @@ class Client:
         #         self.add_message(action_msg)
 
     def run(self):
+        keyboard.add_hotkey('esc', self.stop)
+
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect(("127.0.0.1", 7777))
         self.running = True
@@ -834,11 +840,10 @@ class Client:
 
         self.add_message(ConnectionMessage())
 
+
 TERRARIA_WINDOW_NAME = "Terraria: I don't know that-- aaaaa!"
 
-def screenshot_terraria_window():
-    hwnd = win32gui.FindWindow(None, TERRARIA_WINDOW_NAME)
-
+def screenshot_window(hwnd):
     # Change the line below depending on whether you want the whole window
     # or just the client area.
     #left, top, right, bot = win32gui.GetClientRect(hwnd)
@@ -887,11 +892,20 @@ def main():
     window = pygame.display.set_mode((VIEWPORT_WIDTH*scaling_factor, VIEWPORT_HEIGHT*scaling_factor))
     screen = pygame.Surface((VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
     print("Here")
+
+    # Focus terraria window
+    terraria_hwnd = win32gui.FindWindow(None, TERRARIA_WINDOW_NAME)
+    win32gui.BringWindowToTop(terraria_hwnd)
+
+    vhp = int(VIEWPORT_HEIGHT // 2)
+    vwp = int(VIEWPORT_WIDTH // 2)
+    rect_width = 2
+    rect_height = 2
+    print(vwp, vhp)
+
     try:
         while client.running:
             # print("Tick")
-            client.player.tilex = client.player.posx // 16.0
-            client.player.tiley = (client.player.posy + CHARACTER_HEIGHT) // 16.0
 
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -899,20 +913,24 @@ def main():
 
             screen.fill((0, 0, 0))
             if client.player and client.player.spawned:
+                client.player.tilex = int((client.player.posx + CHARACTER_WIDTH) // 16.0)
+                client.player.tiley = int((client.player.posy + CHARACTER_HEIGHT) // 16.0)
                 client.print_current_state(screen)
-                viewport_startx = int(client.player.tilex - VIEWPORT_WIDTH)
-                viewport_starty = int(client.player.tiley - VIEWPORT_HEIGHT)
-                rect_width = 2
-                rect_height = 2
-                for y in range(0, VIEWPORT_HEIGHT):
-                    for x in range(0, VIEWPORT_WIDTH):
-                        realy = y + viewport_starty
-                        realx = x + viewport_startx
-                        clr = color_for_tile(client.tiles[realy][realx])
-                        pygame.draw.rect(screen, clr, (x, y, rect_width, rect_height))
+                ptiley = client.player.tiley
+                ptilex = client.player.tilex
+                for screeny, yoffset in enumerate(range(-vhp, vhp + 1)):
+                    absy = ptiley + yoffset
+                    for screenx, xoffset in enumerate(range(-vwp, vwp + 1)):
+                        absx = ptilex + xoffset
+                        clr = color_for_tile(client.tiles[absy][absx])
+                        pygame.draw.rect(screen, clr, (screenx, screeny, rect_width, rect_height))
 
             window.blit(pygame.transform.scale(screen, window.get_rect().size), (0, 0))
             pygame.display.flip()
+
+            action_to_perform = random.choice(POSSIBLE_ACTIONS)
+            # action_to_perform()
+
             time.sleep(0.05)
 
     except KeyboardInterrupt:
