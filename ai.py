@@ -10,7 +10,11 @@ from typing import List
 import zlib
 import numpy as np
 from PIL import Image
-
+import random
+import time
+import win32gui
+import win32ui
+from ctypes import windll
 
 # Tiles for which the frame is considered "important".
 TILE_FRAME_IMPORTANT = [
@@ -118,8 +122,11 @@ class MessageType(Enum):
     Status = 9
     TileData = 10
     RecalculateUV = 11
-    SpawnAnswer = 12
+    SpawnRequest = 12
     PlayerControls = 13
+
+    PlayerActive = 14 # Should probably react to this
+
     CharacterHealth = 16
     TileEdit = 17
     BlockUpdate = 20
@@ -129,20 +136,38 @@ class MessageType(Enum):
     UpdateProjectile = 27
     DeleteProjectile = 29
     TogglePVP = 30
+
+    PlayerZone = 36
+
     PasswordRequest = 37
+
+    ThirtyNine = 39  # ??? Remove ItemOwner I guess
+
+    SetActiveNPC = 40
+
     PasswordAnswer = 38
     CharacterMana = 42
     JoinTeam = 45
-    SpawnRequest = 49
+    SpawnSuccessAnswer = 49
     CharacterBuff = 50
     EvilRatio = 57
+
+    NPCHomeUpdate = 60
+
     DailyAnglerQuestFinished = 74
+
+    SyncPlayerChestIndex = 80
+
     ChatMessage = 82
     EightyThree = 83
     CharacterStealth = 84
     InventoryItemInfo = 89
     NinetySix = 96
     TowerShieldStrength = 101
+
+    MoonLordCountdown = 103
+
+    SyncTilePicking = 125
 
     UnknownWhatever = 136
 
@@ -164,7 +189,16 @@ def msg_data_add_int32(b, i):
     b += struct.pack('<i', i)
     return b
 
+def msg_data_add_float(b, f):
+    b += struct.pack('<f', f)
+    return b
+
 Color = List[int]
+
+CHARACTER_HEIGHT = 48.0
+
+def tile_coord_to_pos(coord):
+    return coord * 16.0
 
 @dataclass
 class Player:
@@ -184,6 +218,12 @@ class Player:
 
     mana: int = 200
     max_mana: int = 200
+
+    spawned: bool = False
+    posx: float = 0.0
+    posy: float = 0.0
+    velocity_x: float = 1.0
+    velocity_y: float = 1.0
 
 class ConnectionMessage:
     _type = MessageType.Authentification
@@ -320,6 +360,56 @@ class RequestEssentialTiles:
         b = msg_data_add_int32(b, self.player_spawn_y)
         return b
 
+@dataclass
+class SpawnPlayer:
+    """ Client -> Server """
+    _type = MessageType.SpawnRequest
+    player: Player
+    player_spawn_x: int
+    player_spawn_y: int
+    respawn_time_rem: int
+    spawn_context: int
+    def to_bytes(self):
+        b = bytes()
+        b = msg_data_add_byte(b, self.player.slot_num) # player id
+        b = msg_data_add_short(b, self.player_spawn_x)
+        b = msg_data_add_short(b, self.player_spawn_y)
+        b = msg_data_add_int32(b, self.respawn_time_rem)
+        b = msg_data_add_byte(b, self.spawn_context)
+        return b
+
+UPDATE_VELOCITY = 0x04
+@dataclass
+class PlayerControl:
+    """ Client <-> Server """
+    _type = MessageType.PlayerControls
+    player: Player
+    control_flag: int
+    def to_bytes(self):
+        b = bytes()
+        b = msg_data_add_byte(b, self.player.slot_num) # player id
+
+        b = msg_data_add_byte(b, self.control_flag) # control action byte
+
+        pulley_flags = UPDATE_VELOCITY
+        b = msg_data_add_byte(b, pulley_flags) # pulley byte
+
+        b = msg_data_add_byte(b, 0) # misc byte
+
+        b = msg_data_add_byte(b, 0) # is sleeping
+        b = msg_data_add_byte(b, 0) # selected item
+
+        b = msg_data_add_float(b, self.player.posx) # posx
+        b = msg_data_add_float(b, self.player.posy) # posx
+
+        if pulley_flags & UPDATE_VELOCITY:
+            b = msg_data_add_float(b, self.player.velocity_x) # velocity x
+            b = msg_data_add_float(b, self.player.velocity_y) # velocity y
+
+        print(self.control_flag, self.player.posx, self.player.posy)
+
+        return b
+
 def send_msg(socket, msg):
     msg_data = msg.to_bytes()
     msg_len = len(msg_data)
@@ -372,6 +462,11 @@ def write_world_chunk_to_image(img, tiles, x_start, y_start, width, height):
                 clr = (255,255,255)
             img.putpixel((x,y), clr)
     img.save('world_snapshot.png')
+
+CONTROL_LEFT = 0x04
+CONTROL_RIGHT = 0x08
+CONTROL_JUMP = 0x10
+POSSIBLE_ACTIONS = [CONTROL_JUMP, CONTROL_LEFT, CONTROL_RIGHT]
 
 class Client:
     running = False
@@ -434,7 +529,15 @@ class Client:
         self.world.spawn_x = streamer.next_short()
         self.world.spawn_y = streamer.next_short()
         # TODO: Parse remaining information
-        print(self.world)
+        # Log in
+        self.add_message(SpawnPlayer(self.player, self.world.spawn_x, self.world.spawn_y,
+                                     0, # respawn time remaining
+                                     1  # Player Spawn Context	Byte
+                                        # Enum: 0 = ReviveFromDeath,
+                                        # 1 = SpawningIntoWorld,
+                                        # 2 = RecallFromItem
+                                     ))
+        # Request essential tiles
         self.add_message(RequestEssentialTiles(self.world.spawn_x, self.world.spawn_y))
         self.tiles = np.empty([self.world.max_y, self.world.max_x], dtype=Tile)
         self.newImg1 = Image.new('RGB', (self.world.max_x,self.world.max_y), (255, 255, 255))
@@ -451,7 +554,7 @@ class Client:
         y_start = streamer.next_int32()
         width = streamer.next_short()
         height = streamer.next_short()
-        print("Parsing tile data: x={},y={},width={},height={}".format(x_start,y_start,width,height))
+        # print("Parsing tile data: x={},y={},width={},height={}".format(x_start,y_start,width,height))
 
         # Read actual tile data
         rle = 0
@@ -531,11 +634,72 @@ class Client:
                 t = Tile(tile_type, frame, tile_color)
                 self.tiles[y][x] = t
                 prev_tile = t
-        print('total tiles: {}'.format(len(self.tiles)))
-        print('tile at x={}, y={} ::: {}'.format(SAND_X, SAND_Y, self.tile_at(SAND_X, SAND_Y)))
+        # print('total tiles: {}'.format(len(self.tiles)))
+        # print('tile at x={}, y={} ::: {}'.format(SAND_X, SAND_Y, self.tile_at(SAND_X, SAND_Y)))
 
-    def tile_at(x, y):
+    def tile_at(self, x, y):
         return self.tiles[y][x]
+
+    def update_character_health(self, msg):
+        streamer = Streamer(msg)
+        streamer.next_byte()
+        player_id = streamer.next_byte()
+        # Ignore other players heatlh update
+        if player_id != self.player.slot_num:
+            return
+        self.player.hp = streamer.next_short()
+        self.player.max_hp = streamer.next_short()
+        print('Update player health. Now hp={}, max_hp={}'.format(self.player.hp, self.player.max_hp))
+
+    def on_successfull_spawn(self, msg):
+        self.player.spawned = True
+        self.player.posx = tile_coord_to_pos(self.world.spawn_x)
+        self.player.posy = tile_coord_to_pos(self.world.spawn_y) - CHARACTER_HEIGHT
+
+
+    def sync_spectator_pos_with_target(self):
+        self.add_message(PlayerControl(self.player, 0))
+
+    def server_player_control_update(self, msg):
+        streamer = Streamer(msg)
+        streamer.next_byte()
+
+        player_id = streamer.next_byte()
+
+        # Ignore if other player's position updated
+        # if player_id != self.player.slot_num:
+            # return
+
+        streamer.next_byte() # control
+        pulley = streamer.next_byte() # pulley
+        streamer.next_byte() # misc
+
+        streamer.next_byte() # sleeping
+        streamer.next_byte() # selected item
+
+        posx = streamer.next_float() # posx
+        posy = streamer.next_float() # posy
+
+        velocity_x = 0.0
+        velocity_y = 0.0
+        if pulley & UPDATE_VELOCITY:
+            velocity_x = streamer.next_float()
+            velocity_y = streamer.next_float()
+
+        print('updting player pos to x={},y={}, velocity is ({}, {})'.format(
+            posx, posy, velocity_x, velocity_y))
+
+        self.player.posx = posx
+        self.player.posy = posy
+        self.player.velocity_x = velocity_x
+        self.player.velocity_y = velocity_y
+
+
+        # let original_and_home_pos = if misc & 0x40 != 0 {
+        #     Some((cursor.read(), cursor.read()))
+        # } else {
+        #     None
+        # };
 
     def read_socket(self):
         """ Reading messages loop """
@@ -545,13 +709,34 @@ class Client:
             MessageType.FatalError: self.fatal_error,
             MessageType.WorldInfoAnswer: self.got_world_info,
             MessageType.TileData: self.got_tile_data,
+            MessageType.SpawnSuccessAnswer: self.on_successfull_spawn,
+            MessageType.PlayerControls: self.server_player_control_update,
+
             MessageType.EightyThree: self.ignore_packet,
             MessageType.RecalculateUV: self.ignore_packet,
             MessageType.ItemInfo: self.ignore_packet,
             MessageType.ItemOwnerInfo: self.ignore_packet,
             MessageType.NPCInfo: self.ignore_packet,
-            MessageType.SpawnRequest: self.ignore_packet,
             MessageType.Status: self.ignore_packet,
+
+            MessageType.CharacterInventorySlot: self.ignore_packet,
+            MessageType.EvilRatio: self.ignore_packet,
+
+            MessageType.UpdateProjectile: self.ignore_packet,
+            MessageType.DeleteProjectile: self.ignore_packet,
+
+            MessageType.ThirtyNine: self.ignore_packet,
+            MessageType.UnknownWhatever: self.ignore_packet,
+
+            MessageType.TileEdit: self.ignore_packet,
+            MessageType.BlockUpdate: self.ignore_packet,
+
+            MessageType.CharacterHealth: self.update_character_health,
+            MessageType.CharacterMana: self.ignore_packet, # Should probably sync
+            MessageType.CharacterBuff: self.ignore_packet, # Should probably sync
+
+            MessageType.MoonLordCountdown: self.ignore_packet,
+            MessageType.TowerShieldStrength: self.ignore_packet,
         }
         while self.running:
             packet_length = self.sock.recv(2)
@@ -565,6 +750,9 @@ class Client:
                 continue
             data = self.sock.recv(packet_length)
             msg_type = data[0]
+            if msg_type not in MessageType._value2member_map_:
+                print("Warning: msg_type #{} isn't present in MessageType enum".format(msg_type))
+                continue
             msg_type_typed = MessageType(msg_type)
             handler = handlers.get(msg_type_typed, None)
             if handler is None:
@@ -584,6 +772,18 @@ class Client:
     def add_message(self, msg):
         self.write_queue.append(msg)
 
+    def random_action(self):
+        while self.running:
+            if self.player is not None and self.player.spawned:
+                self.sync_spectator_pos_with_target()
+            time.sleep(1)
+        #         # print("Sending random action")
+        #         action_msg = PlayerControl(
+        #             self.player,
+        #             random.choice(POSSIBLE_ACTIONS)
+        #         )
+        #         self.add_message(action_msg)
+
     def run(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect(("127.0.0.1", 7777))
@@ -594,19 +794,74 @@ class Client:
         write_thread = Thread(target=self.write_socket)
         write_thread.daemon = True
         write_thread.start()
+
+        player_thread = Thread(target=self.random_action)
+        player_thread.daemon = True
+        player_thread.start()
+
         self.add_message(ConnectionMessage())
-        try:
-            while self.running:
-                pass
-        except KeyboardInterrupt:
-            print("Exiting...")
-            self.running = False
-            sys.exit(0)
+
+TERRARIA_WINDOW_NAME = "Terraria: I don't know that-- aaaaa!"
+
+def screenshot_terraria_window():
+    hwnd = win32gui.FindWindow(None, TERRARIA_WINDOW_NAME)
+
+    # Change the line below depending on whether you want the whole window
+    # or just the client area.
+    #left, top, right, bot = win32gui.GetClientRect(hwnd)
+    left, top, right, bot = win32gui.GetWindowRect(hwnd)
+    w = right - left
+    h = bot - top
+
+    hwndDC = win32gui.GetWindowDC(hwnd)
+    mfcDC  = win32ui.CreateDCFromHandle(hwndDC)
+    saveDC = mfcDC.CreateCompatibleDC()
+
+    saveBitMap = win32ui.CreateBitmap()
+    saveBitMap.CreateCompatibleBitmap(mfcDC, w, h)
+
+    saveDC.SelectObject(saveBitMap)
+
+    # Change the line below depending on whether you want the whole window
+    # or just the client area.
+    #result = windll.user32.PrintWindow(hwnd, saveDC.GetSafeHdc(), 1)
+    result = windll.user32.PrintWindow(hwnd, saveDC.GetSafeHdc(), 0)
+    print (result)
+
+    bmpinfo = saveBitMap.GetInfo()
+    bmpstr = saveBitMap.GetBitmapBits(True)
+
+    im = Image.frombuffer(
+        'RGB',
+        (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
+        bmpstr, 'raw', 'BGRX', 0, 1)
+
+    win32gui.DeleteObject(saveBitMap.GetHandle())
+    saveDC.DeleteDC()
+    mfcDC.DeleteDC()
+    win32gui.ReleaseDC(hwnd, hwndDC)
+
+    return im
+    if result == 1:
+        #PrintWindow Succeeded
+        pass
+        print()
+        # im.save("test.png")
 
 
-def run():
+def main():
     client = Client()
     client.run()
+    try:
+        while client.running:
+            game_window_img = screenshot_terraria_window()
+            player_health = client.player.hp
+            print("Tick: ", game_window_img, player_health)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("Exiting...")
+        self.running = False
+        sys.exit(0)
 
 if __name__ == "__main__":
-    run()
+    main()
