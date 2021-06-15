@@ -18,6 +18,16 @@ from ctypes import windll
 import pygame
 import action_controller as ac
 import keyboard
+import copy
+import logging
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+handler = logging.StreamHandler(sys.stdout)
+handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
 # Tiles for which the frame is considered "important".
 TILE_FRAME_IMPORTANT = [
@@ -155,7 +165,7 @@ class MessageType(Enum):
     PasswordAnswer = 38
     CharacterMana = 42
     JoinTeam = 45
-    SpawnSuccessAnswer = 49
+    ConnCompleteSpawnRequest = 49
     CharacterBuff = 50
     EvilRatio = 57
 
@@ -166,7 +176,7 @@ class MessageType(Enum):
     SyncPlayerChestIndex = 80
 
     ChatMessage = 82
-    EightyThree = 83
+    SetNPCKillCount = 83
     CharacterStealth = 84
     InventoryItemInfo = 89
     NinetySix = 96
@@ -234,6 +244,7 @@ class Player:
     mana: int = 200
     max_mana: int = 200
 
+    initialized: bool = False
     spawned: bool = False
     posx: float = 0.0
     posy: float = 0.0
@@ -492,6 +503,8 @@ class Client:
     # World
     world: World = None
     tiles: List[Tile] = []
+    tiles_draft: List[Tile] = []
+    last_time_updated_tiles: float = None
 
     def stop(self):
         print('stopping')
@@ -531,6 +544,7 @@ class Client:
         print("fatal error: {}".format(msg))
 
     def got_world_info(self, msg):
+        print("got world info")
         streamer = Streamer(msg)
         streamer.next_byte()  # Ignore packet ID byte
         self.world = World()
@@ -542,20 +556,31 @@ class Client:
         self.world.spawn_x = streamer.next_short()
         self.world.spawn_y = streamer.next_short()
         # TODO: Parse remaining information
-        # Log in
-        self.add_message(SpawnPlayer(self.player, self.world.spawn_x, self.world.spawn_y,
-                                     0, # respawn time remaining
-                                     1  # Player Spawn Context	Byte
-                                        # Enum: 0 = ReviveFromDeath,
-                                        # 1 = SpawningIntoWorld,
-                                        # 2 = RecallFromItem
-                                     ))
-        # Request essential tiles
-        self.add_message(RequestEssentialTiles(self.world.spawn_x, self.world.spawn_y))
-        self.tiles = np.empty([self.world.max_y, self.world.max_x], dtype=Tile)
-        self.newImg1 = Image.new('RGB', (self.world.max_x,self.world.max_y), (255, 255, 255))
+
+        if self.player.initialized and not self.player.spawned:
+            # Spawn if not already spawned
+            print("spawning player")
+            self.player.spawned = True
+            self.player.posx = tile_coord_to_pos(self.world.spawn_x)
+            self.player.posy = tile_coord_to_pos(self.world.spawn_y) - CHARACTER_HEIGHT
+            self.add_message(SpawnPlayer(self.player, self.world.spawn_x, self.world.spawn_y,
+                                        0, # respawn time remaining
+                                        1  # Player Spawn Context	Byte
+                                            # Enum: 0 = ReviveFromDeath,
+                                            # 1 = SpawningIntoWorld,
+                                            # 2 = RecallFromItem
+                                        ))
+
+        if not self.player.initialized:
+            print("requesting essential tiles")
+            # Request essential tiles
+            self.player.initialized = True
+            self.add_message(RequestEssentialTiles(self.world.spawn_x, self.world.spawn_y))
+            self.tiles = np.empty([self.world.max_y, self.world.max_x], dtype=Tile)
+            self.tiles_draft = np.empty([self.world.max_y, self.world.max_x], dtype=Tile)
 
     def got_tile_data(self, msg):
+        print("got_tile_data")
         streamer = Streamer(msg)
         streamer.next_byte()  # Ignore packet ID byte
         is_compressed = streamer.next_byte()
@@ -579,7 +604,7 @@ class Client:
                 # If there are tiles to repeat
                 if rle != 0:
                     # TODO: Maybe make a copy
-                    self.tiles[y][x] = prev_tile
+                    self.tiles_draft[y][x] = prev_tile
                     rle -= 1
                     continue
                 flag1 = streamer.next_byte()
@@ -645,10 +670,12 @@ class Client:
                     rle = streamer.next_short()
 
                 t = Tile(tile_type, frame, tile_color)
-                self.tiles[y][x] = t
+                self.tiles_draft[y][x] = t
                 prev_tile = t
         # print('total tiles: {}'.format(len(self.tiles)))
         # print('tile at x={}, y={} ::: {}'.format(SAND_X, SAND_Y, self.tile_at(SAND_X, SAND_Y)))
+        # print("got tile data")
+        self.last_time_updated_tiles = time.time()
 
     def tile_at(self, x, y):
         return self.tiles[y][x]
@@ -663,11 +690,6 @@ class Client:
         self.player.hp = streamer.next_short()
         self.player.max_hp = streamer.next_short()
         # print('Update player health. Now hp={}, max_hp={}'.format(self.player.hp, self.player.max_hp))
-
-    def on_successfull_spawn(self, msg):
-        self.player.spawned = True
-        self.player.posx = tile_coord_to_pos(self.world.spawn_x)
-        self.player.posy = tile_coord_to_pos(self.world.spawn_y) - CHARACTER_HEIGHT
 
     def sync_spectator_pos_with_target(self):
         pass
@@ -707,6 +729,8 @@ class Client:
         self.player.velocity_x = velocity_x
         self.player.velocity_y = velocity_y
 
+        logger.debug("player pos update: ({},{})".format(self.player.posx, self.player.posy))
+
         # let original_and_home_pos = if misc & 0x40 != 0 {
         #     Some((cursor.read(), cursor.read()))
         # } else {
@@ -721,7 +745,7 @@ class Client:
             MessageType.FatalError: self.fatal_error,
             MessageType.WorldInfoAnswer: self.got_world_info,
             MessageType.TileData: self.got_tile_data,
-            MessageType.SpawnSuccessAnswer: self.on_successfull_spawn,
+            MessageType.ConnCompleteSpawnRequest: self.ignore_packet,
             MessageType.PlayerControls: self.server_player_control_update,
 
             MessageType.PlayerActive: self.ignore_packet,
@@ -734,7 +758,7 @@ class Client:
             MessageType.SetActiveNPC: self.ignore_packet,
             MessageType.PlayerZone: self.ignore_packet,
 
-            MessageType.EightyThree: self.ignore_packet,
+            MessageType.SetNPCKillCount: self.ignore_packet,
             MessageType.RecalculateUV: self.ignore_packet,
             MessageType.ItemInfo: self.ignore_packet,
             MessageType.ItemOwnerInfo: self.ignore_packet,
@@ -781,8 +805,9 @@ class Client:
             if handler is None:
                 print("No handler for messages of type {}".format(msg_type_typed))
                 continue
+            # print(msg_type_typed)
             handler(data)
-            time.sleep(NETWORK_RW_INTERVAL)
+            # time.sleep(NETWORK_RW_INTERVAL)
             # print("done sleeping")
 
     def write_socket(self):
@@ -809,11 +834,22 @@ class Client:
                 self.player.velocity_y))
             print("\t        hp={},mana={}".format(self.player.hp, self.player.mana))
 
-    def random_action(self):
+    def control_thread(self):
         while self.running:
             if self.player is not None and self.player.spawned:
                 self.sync_spectator_pos_with_target()
-            time.sleep(1)
+
+            if self.last_time_updated_tiles is not None:
+                curr_time = time.time()
+                time_since_last_tile_update = curr_time - self.last_time_updated_tiles
+                TILE_UPDATE_INTERVAL = 0.15
+                # print("diff: {}".format(time_since_last_tile_update))
+                if time_since_last_tile_update > TILE_UPDATE_INTERVAL:
+                    print("Finished updating tiles")
+                    self.last_time_updated_tiles = None
+                    self.tiles = copy.deepcopy(self.tiles_draft)
+
+            time.sleep(0.1)
         #         # print("Sending random action")
         #         action_msg = PlayerControl(
         #             self.player,
@@ -834,7 +870,7 @@ class Client:
         write_thread.daemon = True
         write_thread.start()
 
-        player_thread = Thread(target=self.random_action)
+        player_thread = Thread(target=self.control_thread)
         player_thread.daemon = True
         player_thread.start()
 
@@ -915,9 +951,10 @@ def main():
             if client.player and client.player.spawned:
                 client.player.tilex = int((client.player.posx + CHARACTER_WIDTH) // 16.0)
                 client.player.tiley = int((client.player.posy + CHARACTER_HEIGHT) // 16.0)
-                client.print_current_state(screen)
+                # client.print_current_state(screen)
                 ptiley = client.player.tiley
                 ptilex = client.player.tilex
+                # logger.debug("rerendering with pos ({},{})".format(ptilex, ptiley))
                 for screeny, yoffset in enumerate(range(-vhp, vhp + 1)):
                     absy = ptiley + yoffset
                     for screenx, xoffset in enumerate(range(-vwp, vwp + 1)):
@@ -931,7 +968,7 @@ def main():
             action_to_perform = random.choice(POSSIBLE_ACTIONS)
             # action_to_perform()
 
-            time.sleep(0.05)
+            # time.sleep(0.05)
 
     except KeyboardInterrupt:
         print("Exiting...")
