@@ -15,6 +15,7 @@ import time
 import win32gui
 import win32ui
 from ctypes import windll
+import pygame
 
 # Tiles for which the frame is considered "important".
 TILE_FRAME_IMPORTANT = [
@@ -63,6 +64,10 @@ TILE_FRAME_IMPORTANT = [
     True, True, True, True, True, True, True, True, True, True, True, True, False, True, True,
     True, True,
 ]
+
+VIEWPORT_WIDTH = 20
+VIEWPORT_HEIGHT = VIEWPORT_WIDTH
+NETWORK_RW_INTERVAL = 0.01
 
 TileType = int
 
@@ -163,13 +168,20 @@ class MessageType(Enum):
     CharacterStealth = 84
     InventoryItemInfo = 89
     NinetySix = 96
+
+    NotifyPlayerOfEvent = 98
+
     TowerShieldStrength = 101
 
     MoonLordCountdown = 103
 
-    SyncTilePicking = 125
+    PlayerHurtV2 = 117
 
+    SyncTilePicking = 125
+    FinishedConnectingToServer  = 129
     UnknownWhatever = 136
+    SetCountsAsHostForGameplay = 139
+
 
 def msg_data_add_byte(b, d):
     b += struct.pack('<b', d)
@@ -406,7 +418,7 @@ class PlayerControl:
             b = msg_data_add_float(b, self.player.velocity_x) # velocity x
             b = msg_data_add_float(b, self.player.velocity_y) # velocity y
 
-        print(self.control_flag, self.player.posx, self.player.posy)
+        # print(self.control_flag, self.player.posx, self.player.posy)
 
         return b
 
@@ -442,24 +454,21 @@ class LiquidType(Enum):
     Honey = 3
 
 
+MIN_TILE_TYPE   = -100
+MAX_TILE_TYPE   = 1000
+MAX_COLOR_VALUE = 255
+def color_for_tile(t):
+    if t is None or t.tile_type is None:
+        return (0, 0, 0)
+    tt = int((((t.tile_type - MIN_TILE_TYPE) * MAX_COLOR_VALUE) / (MAX_TILE_TYPE - MIN_TILE_TYPE)))
+    # print(t.tile_type, tt)
+    return (tt, tt, tt)
+
 # Save world image into a file
 def write_world_chunk_to_image(img, tiles, x_start, y_start, width, height):
     for y in range (y_start, y_start + height):
         for x in range (x_start, x_start + width):
-            clr = (0, 0, 255) if tiles[y][x] is not None else None
-            t = tiles[y][x]
-            if t == None:
-                clr = (255, 255, 0)
-            elif t.tile_type == None:
-                clr = (0, 0, 0)
-            elif t.tile_type == 0:
-                clr = (151, 107, 75)
-            elif t.tile_type == 1:
-                clr = (128, 128, 128)
-            elif t.tile_type == 53:
-                clr = (255, 218, 56)
-            else:
-                clr = (255,255,255)
+            clr = color_for_tile(tiles[y][x])
             img.putpixel((x,y), clr)
     img.save('world_snapshot.png')
 
@@ -645,20 +654,20 @@ class Client:
         streamer.next_byte()
         player_id = streamer.next_byte()
         # Ignore other players heatlh update
-        if player_id != self.player.slot_num:
-            return
+        # if player_id != self.player.slot_num:
+            # return
         self.player.hp = streamer.next_short()
         self.player.max_hp = streamer.next_short()
-        print('Update player health. Now hp={}, max_hp={}'.format(self.player.hp, self.player.max_hp))
+        # print('Update player health. Now hp={}, max_hp={}'.format(self.player.hp, self.player.max_hp))
 
     def on_successfull_spawn(self, msg):
         self.player.spawned = True
         self.player.posx = tile_coord_to_pos(self.world.spawn_x)
         self.player.posy = tile_coord_to_pos(self.world.spawn_y) - CHARACTER_HEIGHT
 
-
     def sync_spectator_pos_with_target(self):
-        self.add_message(PlayerControl(self.player, 0))
+        pass
+        # self.add_message(PlayerControl(self.player, 0))
 
     def server_player_control_update(self, msg):
         streamer = Streamer(msg)
@@ -686,14 +695,13 @@ class Client:
             velocity_x = streamer.next_float()
             velocity_y = streamer.next_float()
 
-        print('updting player pos to x={},y={}, velocity is ({}, {})'.format(
-            posx, posy, velocity_x, velocity_y))
+        # print('updting player pos to x={},y={}, velocity is ({}, {})'.format(
+            # posx, posy, velocity_x, velocity_y))
 
         self.player.posx = posx
         self.player.posy = posy
         self.player.velocity_x = velocity_x
         self.player.velocity_y = velocity_y
-
 
         # let original_and_home_pos = if misc & 0x40 != 0 {
         #     Some((cursor.read(), cursor.read()))
@@ -711,6 +719,16 @@ class Client:
             MessageType.TileData: self.got_tile_data,
             MessageType.SpawnSuccessAnswer: self.on_successfull_spawn,
             MessageType.PlayerControls: self.server_player_control_update,
+
+            MessageType.PlayerActive: self.ignore_packet,
+            MessageType.CharacterCreation: self.ignore_packet,
+            MessageType.TogglePVP: self.ignore_packet,
+            MessageType.JoinTeam: self.ignore_packet,
+            MessageType.SyncPlayerChestIndex: self.ignore_packet,
+            MessageType.NPCHomeUpdate: self.ignore_packet,
+            MessageType.DailyAnglerQuestFinished: self.ignore_packet,
+            MessageType.SetActiveNPC: self.ignore_packet,
+            MessageType.PlayerZone: self.ignore_packet,
 
             MessageType.EightyThree: self.ignore_packet,
             MessageType.RecalculateUV: self.ignore_packet,
@@ -739,6 +757,7 @@ class Client:
             MessageType.TowerShieldStrength: self.ignore_packet,
         }
         while self.running:
+            # print("receiving")
             packet_length = self.sock.recv(2)
             if len(packet_length) < 2:
                 self.stop()
@@ -759,6 +778,8 @@ class Client:
                 print("No handler for messages of type {}".format(msg_type_typed))
                 continue
             handler(data)
+            time.sleep(NETWORK_RW_INTERVAL)
+            # print("done sleeping")
 
     def write_socket(self):
         """ Writing messages loop """
@@ -768,9 +789,21 @@ class Client:
                 msg = self.write_queue[0]
                 self.write_queue.pop(0)
                 send_msg(self.sock, msg)
+            time.sleep(NETWORK_RW_INTERVAL)
 
     def add_message(self, msg):
         self.write_queue.append(msg)
+
+    def print_current_state(self, screen):
+        if self.player is not None and self.player.spawned:
+            print("\tPlayer: x={},y={},tilex={},tiley={},vel=({},{})".format(
+                self.player.posx,
+                self.player.posy,
+                self.player.tilex,
+                self.player.tiley,
+                self.player.velocity_x,
+                self.player.velocity_y))
+            print("\t        hp={},mana={}".format(self.player.hp, self.player.mana))
 
     def random_action(self):
         while self.running:
@@ -841,26 +874,50 @@ def screenshot_terraria_window():
     mfcDC.DeleteDC()
     win32gui.ReleaseDC(hwnd, hwndDC)
 
-    return im
     if result == 1:
         #PrintWindow Succeeded
-        pass
-        print()
+        return im
         # im.save("test.png")
 
-
 def main():
+    pygame.init()
     client = Client()
     client.run()
+    scaling_factor = 24
+    window = pygame.display.set_mode((VIEWPORT_WIDTH*scaling_factor, VIEWPORT_HEIGHT*scaling_factor))
+    screen = pygame.Surface((VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
+    print("Here")
     try:
         while client.running:
-            game_window_img = screenshot_terraria_window()
-            player_health = client.player.hp
-            print("Tick: ", game_window_img, player_health)
-            time.sleep(1)
+            # print("Tick")
+            client.player.tilex = client.player.posx // 16.0
+            client.player.tiley = (client.player.posy + CHARACTER_HEIGHT) // 16.0
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    client.running = False
+
+            screen.fill((0, 0, 0))
+            if client.player and client.player.spawned:
+                client.print_current_state(screen)
+                viewport_startx = int(client.player.tilex - VIEWPORT_WIDTH)
+                viewport_starty = int(client.player.tiley - VIEWPORT_HEIGHT)
+                rect_width = 2
+                rect_height = 2
+                for y in range(0, VIEWPORT_HEIGHT):
+                    for x in range(0, VIEWPORT_WIDTH):
+                        realy = y + viewport_starty
+                        realx = x + viewport_startx
+                        clr = color_for_tile(client.tiles[realy][realx])
+                        pygame.draw.rect(screen, clr, (x, y, rect_width, rect_height))
+
+            window.blit(pygame.transform.scale(screen, window.get_rect().size), (0, 0))
+            pygame.display.flip()
+            time.sleep(0.05)
+
     except KeyboardInterrupt:
         print("Exiting...")
-        self.running = False
+        client.running = False
         sys.exit(0)
 
 if __name__ == "__main__":
