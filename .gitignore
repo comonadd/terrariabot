@@ -3,3 +3,9 @@ TShock
 world_snapshot.png
 *.png
 __pycache__
+Terraria
+Terraria2
+checkpoint
+*.dqn*
+ServerLog.txt
+*.log
